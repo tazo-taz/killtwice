@@ -160,7 +160,13 @@ One thing v1 got wrong that no amount of care would have caught: nothing in it s
 
 ## 12. Measured
 
-See the README for the full capacity notes. Numbers are from `make verify FAST=1` on the development machine (Windows 11, Docker Desktop, 512MB pipeline cap), not from a target environment.
+Full capacity notes are in the README. From `make verify FAST=1` (500,000 rows) on the development machine — Windows 11, Docker Desktop, everything on one host, 512MB pipeline cap. Not a target environment and not a benchmark.
+
+- All five gates pass in **565s**, including two complete backfills.
+- Backfill sustains **~3,600 rows/s**; the bottleneck is Elasticsearch `_bulk`, not the reader.
+- The pipeline peaks at **73MB of its 512MB cap** under full load, which is the streaming claim in §4 invariant 3 holding.
+- G2 absorbed **13,203 duplicate deliveries with zero duplicate stored rows** — the declared guarantee in §3, as two numbers.
+- CPU during a sink outage: **8.9% mean** against a 25% limit. The backoff sleeps.
 
 ## 13. Acceptance
 
