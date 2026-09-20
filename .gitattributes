@@ -1,0 +1,6 @@
+# Shell scripts must stay LF even when checked out on Windows — they run
+# inside Linux containers and under Git Bash.
+*.sh            text eol=lf
+Makefile        text eol=lf
+*.cmd           text eol=crlf
+*.md            text

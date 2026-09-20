@@ -1,0 +1,17 @@
+node_modules/
+dist/
+build/
+coverage/
+
+# local env overrides; .env.example is committed
+.env
+.env.local
+
+# verify/capacity run output — regenerated, never reviewed from git
+artifacts/
+*.log
+
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
