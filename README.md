@@ -131,6 +131,8 @@ The G2 number is the one to read carefully. **13,203 duplicate deliveries and ze
 
 Kills landed at rows 68,000, 130,000 and 258,000 — genuinely spread across the backfill rather than clustered, which an earlier version of the gate got wrong (`docs/DEVIATIONS.md` D-009).
 
+**These are one run's figures, and they move.** Across four full runs the suite took 521–569s, absorbed duplicates ranged 8,868–14,182 (the kills land at different points each time), and G3's mean CPU ranged **3.5% to 18.8%** against its 25% limit. That last range is the one to be careful about: the headroom is real but not enormous on a machine also running Postgres, Elasticsearch and RabbitMQ. If the threshold is ever tripped on a busier machine, the honest reading is that it is measuring the host and not the backoff — but I have left it at 25% rather than raise it to be safe, because a threshold tuned until it passes is not a threshold.
+
 
 `make verify` performs the destruction itself — it SIGKILLs containers, pauses Elasticsearch, and inserts genuinely malformed rows. There is no step that asks you to open a second terminal.
 
