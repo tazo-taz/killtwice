@@ -1,0 +1,140 @@
+name: killittwice
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    # wal_level=logical is what makes the replication slot possible; without it
+    # the CDC reader cannot start at all.
+    command: >
+      postgres
+      -c wal_level=logical
+      -c max_replication_slots=8
+      -c max_wal_senders=8
+      -c shared_buffers=512MB
+      -c max_wal_size=4GB
+      -c checkpoint_timeout=15min
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: app
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+      - ./db:/db:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d app"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.0
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      # 1g rather than 2g: the reviewer's Docker Desktop has to survive this
+      # alongside Postgres, RabbitMQ and the services.
+      ES_JAVA_OPTS: "-Xms1g -Xmx1g"
+      # Deliberately small so an oversized document is a reachable failure
+      # mode for G4's second poison type.
+      http.max_content_length: 20mb
+    ports:
+      - "9200:9200"
+    volumes:
+      - esdata:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9200/_cluster/health | grep -qE '\"status\":\"(green|yellow)\"'"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: app
+      RABBITMQ_DEFAULT_PASS: app
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - mqdata:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+
+  pipeline:
+    build: ./services/pipeline
+    # LOAD-BEARING. 5GB of source data against 512MB of RAM is what makes
+    # "we stream, we do not buffer" a constraint instead of a claim. Raising
+    # this invalidates the capacity argument in the README.
+    mem_limit: 512m
+    environment:
+      PORT: "3000"
+      SOURCE_DB_URL: postgres://app:app@postgres:5432/app
+      PIPELINE_DB_URL: postgres://app:app@postgres:5432/app
+      ES_NODE: http://elasticsearch:9200
+      ES_INDEX: records
+      AMQP_URL: amqp://app:app@rabbitmq:5672
+      MQ_EXCHANGE: records.changes
+      SLOT_NAME: records_slot
+      PUBLICATION_NAME: records_pub
+      BACKFILL_CHUNK_SIZE: "2000"
+      CDC_BATCH_SIZE: "1000"
+      QUEUE_CAPACITY: "20000"
+      NODE_OPTIONS: "--max-old-space-size=384"
+      LOG_LEVEL: info
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres: { condition: service_healthy }
+      elasticsearch: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+    # No restart policy on purpose. G1 is about what this process does when it
+    # is started again, not about whether Docker restarts it - an automatic
+    # restart would hide whether the resume works or merely looks like it.
+    restart: "no"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/health >/dev/null || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  consumer:
+    build: ./services/consumer
+    mem_limit: 256m
+    environment:
+      PORT: "3001"
+      PIPELINE_DB_URL: postgres://app:app@postgres:5432/app
+      AMQP_URL: amqp://app:app@rabbitmq:5672
+      MQ_EXCHANGE: records.changes
+      MQ_QUEUE: records.consumer
+      PREFETCH: "200"
+      LOG_LEVEL: info
+    ports:
+      - "3001:3001"
+    depends_on:
+      postgres: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3001/health >/dev/null || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  ui:
+    build: ./services/ui
+    ports:
+      - "8080:80"
+    depends_on:
+      - pipeline
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  esdata:
+  mqdata:
