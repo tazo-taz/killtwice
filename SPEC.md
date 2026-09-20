@@ -1,7 +1,7 @@
 # SPEC — Kill It Twice
 
-**Version:** v1
-**Status:** written before any implementation code exists. Expect this document to be wrong in places; corrections land as v2/v3 with the reasoning attached, and every place the implementation contradicts it gets logged in `docs/DEVIATIONS.md`.
+**Version:** v2 — see [Revision history](#11-revision-history) for what changed from v1 and why.
+**Status:** v1 was written before any implementation code existed, and was wrong in the places recorded below. Every point where the implementation contradicted it is logged in `docs/DEVIATIONS.md`.
 **Audience:** me, and the coding agent working under `AGENTS.md`.
 
 ---
@@ -92,17 +92,17 @@ Each gate is a failure mode with a measurable success criterion. `make verify` p
 
 **A FAIL that is explained honestly is a better outcome than a PASS that was arranged.** If a gate cannot be made to pass, it prints FAIL and the README says why.
 
-## 7. Open questions
+## 7. Open questions — resolved
 
-Unresolved on purpose. Each one gets an answer and a reason in a later revision.
+All seven are answered. The answers are kept here rather than silently folded into the text above, because how a question was closed is more useful than the fact that it is closed.
 
-1. **Deletes in Elasticsearch under external versioning.** ES retains a deleted document's version only for `index.gc_deletes` (default 60s), after which a stale upsert can resurrect the row. Options: accept and document the window, raise `gc_deletes`, or soft-delete with a `deleted` flag. Leaning soft-delete — it is the standard search-index answer and removes the class of bug entirely — but it costs an index-wide filter on every query, which may be worth measuring first.
-2. **Same record from both readers inside one batch.** Presumably dedupe by `max(row_version)` per id before the batch is sent. Cheap, but it needs to be confirmed that it does not mask an ordering bug rather than fixing one.
-3. **Replication slot growth while the pipeline is down.** WAL accumulates and can fill the source disk. Needs a `slot_lag_bytes` threshold and a written runbook line for when to drop the slot and re-backfill. The threshold value is unknown until measured.
-4. **Does the backfill terminate?** Intent is to snapshot `max(id)` at job start and let anything newer arrive via the stream. Unverified against the case where the mutator is running at seed time.
-5. **Consumer restart semantics.** Manual ack after the projection write, same ordering rule as invariant 1 — but the redelivery behaviour on an unacked message at kill time needs to be observed rather than assumed.
-6. **CPU threshold for G3.** Cannot be chosen before the idle baseline is measured on the target machine. Placeholder: 25% mean.
-7. **Whether 5M rows keeps `make verify` under ~20 minutes** on a reviewer's laptop. If not, the default drops and the README says which volume produced the published numbers.
+1. **Deletes in Elasticsearch under external versioning.** **Resolved: soft delete.** The mutator sets `deleted = true`, which bumps `row_version` through the trigger, so a delete is an ordinary versioned update and the `gc_deletes` resurrection window never applies. A real `DELETE` is still handled — `REPLICA IDENTITY FULL` puts the old row and its version in the WAL, the CDC reader turns it into a versioned ES delete, and the consumer stores a tombstone. That path *is* exposed to the 60s window, and that is documented rather than fixed. The feared cost (an index-wide filter on every query) did not materialise, because the operator UI wants to see deleted records anyway.
+2. **Same record from both readers inside one batch.** **Resolved: dedupe by `max(row_version)` per id in `WriterService.dedupe`.** It does not mask an ordering bug: the sinks would refuse the older write regardless, so this only saves the round trip. That is the test for whether a dedupe is a fix or a cover-up — remove it and the system must still be correct, just slower.
+3. **Replication slot growth while the pipeline is down.** **Resolved as a metric, not a mechanism.** `pipeline_cdc_slot_lag_bytes` is surfaced in the UI and in `/api/status`. No automatic slot-dropping: quietly dropping a slot loses changes, and a pipeline that silently loses changes to protect a disk is the failure this whole project is about. The runbook line is in the README.
+4. **Does the backfill terminate?** **Resolved: yes, by snapshotting `max(id)` at job start.** The chunk query is bounded by `id <= max_key`, so rows created after the job started are the stream's problem, not the backfill's. Verified with the mutator running.
+5. **Consumer restart semantics.** **Resolved: manual ack after the projection write.** Killing the consumer mid-flight redelivers whatever was unacked, and G2 does exactly that. The observed behaviour matches the assumption, and the redelivery count is now persisted so killing the consumer does not erase the evidence.
+6. **CPU threshold for G3.** **Resolved: 25% mean, which the implementation clears by a wide margin.** Measured on this machine: ~16% while actively writing, ~2.7% mean while the sink is paused. The threshold stays at 25% rather than being tightened to the measured value — a gate calibrated to the current implementation stops being a test of the requirement and becomes a test of today's performance.
+7. **Whether 5M rows keeps `make verify` under ~20 minutes.** **Open in a narrower form.** See §12 for the measured numbers. `FAST=1` (500k) is the documented smoke run and the README states which mode produced which figure.
 
 ## 8. Interfaces
 
@@ -123,6 +123,45 @@ POST /api/chaos/poison       inject rejectable rows
 POST /api/chaos/mutate       { rate, ops }        drive source mutations
 ```
 
-## 9. Acceptance
+## 9. Backpressure, restated
+
+v1 described "a bounded in-process queue" as *the* backpressure point, shared by both readers. That is not what got built, and the reason is worth writing down.
+
+Each reader owns its own flow control:
+
+- **Backfill** awaits the write of one chunk before reading the next. It never reads ahead, so its memory ceiling is one chunk (`BACKFILL_CHUNK_SIZE` × row size) regardless of how long a sink is down.
+- **CDC** buffers up to `QUEUE_CAPACITY` envelopes; when it fills, the reader stops the replication subscription entirely and Postgres retains the changes in WAL. The durable buffer is the slot, not our heap.
+
+A single shared queue would have made the checkpoint ambiguous: a mixed batch has two cursors to advance and no ordering that is correct for both. Two paths, two cursors, each advancing only after its own batch is acknowledged.
+
+## 10. Seeding is a reset
+
+`make seed` truncates the source, which invalidates everything downstream. So seeding also drops the Elasticsearch index, the consumer projection, the checkpoints and the DLQ, and drops and recreates the replication slot around the load.
+
+The slot part is not housekeeping. With a slot open, a five-million-row bulk load streams back through CDC as five million "changes" — correct by the invariants and completely pointless. This was not in v1 at all; the gap only became visible once the slot existed.
+
+## 11. Revision history
+
+**v2 (2026-09-20)** — written after the implementation existed, correcting v1 where reality disagreed:
+
+| Change | Why |
+|---|---|
+| §9 added: two independent flow-control paths, not one shared queue | a shared queue makes the checkpoint ambiguous — `docs/DEVIATIONS.md` D-001 |
+| §10 added: seeding is a full reset, including the replication slot | v1 said only "generates the data", which is not implementable once a slot exists — D-005 |
+| §7 open questions answered, with the reasoning kept | the answers are the interesting part |
+| §12 added: measured numbers | v1 had a target throughput and no evidence |
+| Deletes fixed as soft-delete, hard delete kept as a secondary path | D-004 |
+
+**v1 (2026-09-20)** — written before any implementation code existed. The root commit of this repository.
+
+Two things v1 got right that were worth the trouble: the checkpoint ordering rule, which the implementation follows exactly, and declaring the guarantee before building — every design argument afterwards reduced to "does this preserve the version guard?", which is a much easier question than the one it replaced.
+
+One thing v1 got wrong that no amount of care would have caught: nothing in it suggested that retry attempts and transport failures needed separate counters. That bug (D-002) would have dead-lettered healthy rows during a sink outage — data loss wearing a DLQ costume — and it was found by asking what happens during a sixty-second outage, not by writing the spec.
+
+## 12. Measured
+
+See the README for the full capacity notes. Numbers are from `make verify FAST=1` on the development machine (Windows 11, Docker Desktop, 512MB pipeline cap), not from a target environment.
+
+## 13. Acceptance
 
 The submission is done when `git clone && docker compose up && make seed && make verify` works from a clean machine, every gate prints a measured PASS or an explained FAIL, and the README carries the architecture diagram with checkpoint and DLQ marked, at least four ADRs, the capacity numbers, what was not built and why, and at least two real cases where the generated code deviated from this document.
