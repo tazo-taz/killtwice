@@ -1,0 +1,20 @@
+{
+  "name": "killittwice-consumer",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/main.js"
+  },
+  "dependencies": {
+    "amqplib": "^0.10.4",
+    "pg": "^8.13.0",
+    "pino": "^9.4.0"
+  },
+  "devDependencies": {
+    "@types/amqplib": "^0.10.5",
+    "@types/node": "^22.7.4",
+    "@types/pg": "^8.11.10",
+    "typescript": "^5.6.2"
+  }
+}
