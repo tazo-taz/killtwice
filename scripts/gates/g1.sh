@@ -23,7 +23,7 @@ step "G1: resetting and starting backfill over $TOTAL rows"
 reset_and_backfill
 
 step "G1: waiting for rows_done > $KILL_AFTER"
-if ! wait_until 900 '[ "$(int "$(metric pipeline_backfill_rows_done)")" -gt '"$KILL_AFTER"' ]'; then
+if ! wait_until 900 '[ "$(int "$(rows_done_db)")" -gt '"$KILL_AFTER"' ]'; then
   echo "backfill never reached $KILL_AFTER rows"
   exit 1
 fi

@@ -21,12 +21,12 @@ KILLS=0
 for fraction in 8 4 2; do
   TARGET=$(( TOTAL / fraction ))
   step "G2: waiting for rows_done > $TARGET before kill $(( KILLS + 1 ))"
-  if ! wait_until 900 '[ "$(int "$(metric pipeline_backfill_rows_done)")" -gt '"$TARGET"' ]'; then
+  if ! wait_until 900 '[ "$(int "$(rows_done_db)")" -gt '"$TARGET"' ]'; then
     step "G2: backfill passed $TARGET before we could kill - continuing"
     continue
   fi
 
-  AT=$(int "$(metric pipeline_backfill_rows_done)")
+  AT=$(int "$(rows_done_db)")
   kill_pipeline
   KILLS=$(( KILLS + 1 ))
   step "G2: kill $KILLS at rows_done=$AT"

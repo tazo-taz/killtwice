@@ -169,6 +169,13 @@ reset_and_backfill() {
 # takes the first match.
 backfill_state() { json_str "$(api_get /api/status)" status; }
 
+# Straight from the checkpoint table. The Prometheus gauges are refreshed on a
+# 2s timer, so immediately after a reset they still hold the *previous* run's
+# figure - a gate that waits on the gauge fires instantly against a stale
+# reading and kills the pipeline before it has done any work.
+rows_done_db() { psql_q "SELECT rows_done FROM pipeline.backfill_jobs WHERE id='default'"; }
+last_key_db()  { psql_q "SELECT last_key  FROM pipeline.backfill_jobs WHERE id='default'"; }
+
 wait_for_backfill_done() {
   wait_until "${1:-1800}" '[ "$(backfill_state)" = "done" ]'
 }

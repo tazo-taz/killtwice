@@ -46,6 +46,26 @@ export interface Status {
 export class StatusService implements OnApplicationBootstrap, OnModuleDestroy {
   private timer: ReturnType<typeof setInterval> | null = null;
 
+  // Last known sink reachability, refreshed on the timer. `/api/status` reads
+  // this instead of probing inline: probing means the status endpoint blocks
+  // for as long as the sink takes to time out, so it becomes unusable exactly
+  // when an operator needs it most. "Is the system healthy?" has to be
+  // answerable *during* an outage, not only outside one.
+  private sinkUp = { elasticsearch: false, rabbitmq: false };
+
+  /** Never let a slow dependency hold a status response hostage. */
+  private async orDefault<T>(p: Promise<T>, fallback: T, ms = 2000): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<T>((resolve) => {
+      timer = setTimeout(() => resolve(fallback), ms);
+    });
+    try {
+      return await Promise.race([p.catch(() => fallback), timeout]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
   constructor(
     private readonly db: DbService,
     private readonly backfill: BackfillService,
@@ -84,9 +104,16 @@ export class StatusService implements OnApplicationBootstrap, OnModuleDestroy {
     await this.dlq.refreshGauge();
 
     // Liveness of each sink, so `sink_up` is a real probe and not just a
-    // record of whether we happened to write recently.
-    this.metrics.sinkUp.set({ sink: 'elasticsearch' }, (await this.es.ping()) ? 1 : 0);
-    this.metrics.sinkUp.set({ sink: 'rabbitmq' }, (await this.mq.ping()) ? 1 : 0);
+    // record of whether we happened to write recently. This runs on the timer
+    // where blocking costs nothing; the result is cached for `/api/status`.
+    // Bounded at 2s. An unbounded ping against a paused sink inherits the
+    // client's 15s request timeout, so `healthy` would keep answering true
+    // for fifteen seconds into an outage - which is a wrong answer, not a
+    // slow one.
+    this.sinkUp.elasticsearch = await this.orDefault(this.es.ping(), false, 2000);
+    this.sinkUp.rabbitmq = await this.orDefault(this.mq.ping(), false, 2000);
+    this.metrics.sinkUp.set({ sink: 'elasticsearch' }, this.sinkUp.elasticsearch ? 1 : 0);
+    this.metrics.sinkUp.set({ sink: 'rabbitmq' }, this.sinkUp.rabbitmq ? 1 : 0);
   }
 
   async consumerCount(): Promise<number> {
@@ -103,12 +130,15 @@ export class StatusService implements OnApplicationBootstrap, OnModuleDestroy {
       this.dlq.counts(),
     ]);
 
-    const [sourceCount, esCount, consumerCount, esUp, mqUp] = await Promise.all([
-      this.chaos.sourceCount().catch(() => -1),
-      this.es.count().catch(() => -1),
-      this.consumerCount(),
-      this.es.ping(),
-      this.mq.ping(),
+    const esUp = this.sinkUp.elasticsearch;
+    const mqUp = this.sinkUp.rabbitmq;
+
+    // -1 means "could not read in time", which is a different fact from 0 and
+    // is rendered as such in the UI.
+    const [sourceCount, esCount, consumerCount] = await Promise.all([
+      this.orDefault(this.chaos.sourceCount(), -1),
+      this.orDefault(this.es.count(), -1),
+      this.orDefault(this.consumerCount(), -1),
     ]);
 
     const rowsDone = Number(state?.rows_done ?? 0);

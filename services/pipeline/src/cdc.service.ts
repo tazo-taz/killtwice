@@ -52,6 +52,7 @@ export class CdcService {
   private lastCommitTs: Date | null = null;
   private eventsDone = 0;
   private confirmedLsn: string | null = null;
+  private lastSeenLsn: string | null = null;
   private flusher: Promise<void> | null = null;
 
   constructor(
@@ -205,6 +206,7 @@ export class CdcService {
       });
 
       service.on('data', (lsn: string, log: PgoutputMessage) => {
+        this.lastSeenLsn = lsn;
         if (log.tag === 'commit') {
           this.lastCommitTs = this.toDate(log.commitTime) ?? this.lastCommitTs;
           return;
@@ -225,6 +227,21 @@ export class CdcService {
           );
           void service.stop().catch(() => undefined);
         }
+      });
+
+      // A keepalive carries the server's current WAL position and means
+      // "nothing more for you up to here". Recording it is what lets an idle
+      // slot advance: without it restart_lsn stays pinned through any period
+      // with no published changes, while WAL from every other table piles up
+      // behind it.
+      //
+      // Recorded only, never acknowledged from here. The flusher acknowledges
+      // it when the buffer is empty, because acking a position past events
+      // that are buffered but not yet written would skip them. Events always
+      // arrive in LSN order, so a keepalive seen now is never behind
+      // something still in the buffer.
+      service.on('heartbeat', (lsn: string) => {
+        this.lastSeenLsn = lsn;
       });
 
       service.on('error', (err: unknown) => {
@@ -253,9 +270,41 @@ export class CdcService {
     }
   }
 
+  private async persistCheckpoint(lsn: string, commitTs: Date | null): Promise<void> {
+    await this.db.pipeline.query(
+      `INSERT INTO pipeline.stream_checkpoint
+         (slot_name, confirmed_lsn, last_commit_ts, events_done, updated_at)
+       VALUES ($1,$2,$3,$4, now())
+       ON CONFLICT (slot_name) DO UPDATE SET
+         confirmed_lsn = EXCLUDED.confirmed_lsn,
+         last_commit_ts = COALESCE(EXCLUDED.last_commit_ts, pipeline.stream_checkpoint.last_commit_ts),
+         events_done = EXCLUDED.events_done,
+         updated_at = now()`,
+      [config.slotName, lsn, commitTs, this.eventsDone],
+    );
+  }
+
   private async runFlusher(): Promise<void> {
     while (this.enabled || this.buffer.length > 0) {
       if (this.buffer.length === 0) {
+        // An empty buffer means everything received has been flushed, so the
+        // slot can be moved forward to the last message we saw.
+        //
+        // Without this the slot only ever advances when a batch is flushed,
+        // and `restart_lsn` stays pinned while Postgres keeps generating WAL
+        // for every other table - including this pipeline's own checkpoint
+        // writes. Measured: ~57MB of retained WAL over a ten minute run in
+        // which the stream carried almost nothing.
+        if (this.lastSeenLsn && this.lastSeenLsn !== this.confirmedLsn) {
+          const idleLsn = this.lastSeenLsn;
+          try {
+            await this.service?.acknowledge(idleLsn);
+            this.confirmedLsn = idleLsn;
+            await this.persistCheckpoint(idleLsn, null);
+          } catch {
+            /* between subscriptions; the persisted LSN still covers us */
+          }
+        }
         await sleep(200);
         continue;
       }
@@ -270,17 +319,7 @@ export class CdcService {
       // Same ordering rule as the backfill: sinks first, cursor second.
       this.eventsDone += take.length;
       this.confirmedLsn = lastLsn;
-      await this.db.pipeline.query(
-        `INSERT INTO pipeline.stream_checkpoint
-           (slot_name, confirmed_lsn, last_commit_ts, events_done, updated_at)
-         VALUES ($1,$2,$3,$4, now())
-         ON CONFLICT (slot_name) DO UPDATE SET
-           confirmed_lsn = EXCLUDED.confirmed_lsn,
-           last_commit_ts = COALESCE(EXCLUDED.last_commit_ts, pipeline.stream_checkpoint.last_commit_ts),
-           events_done = EXCLUDED.events_done,
-           updated_at = now()`,
-        [config.slotName, lastLsn, lastCommit, this.eventsDone],
-      );
+      await this.persistCheckpoint(lastLsn, lastCommit);
 
       // Telling Postgres it may release the WAL up to here. Only now - the
       // slot is our durable buffer and it must not be trimmed ahead of the

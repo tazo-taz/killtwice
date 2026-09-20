@@ -98,7 +98,10 @@ services:
     # restart would hide whether the resume works or merely looks like it.
     restart: "no"
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/health >/dev/null || exit 1"]
+      # 127.0.0.1, not localhost. busybox wget resolves localhost to ::1 while
+      # Node listens on IPv4, so the check fails against a perfectly healthy
+      # process and the container sits permanently unhealthy.
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/health >/dev/null || exit 1"]
       interval: 5s
       timeout: 5s
       retries: 20
@@ -121,7 +124,7 @@ services:
       rabbitmq: { condition: service_healthy }
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:3001/health >/dev/null || exit 1"]
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3001/health >/dev/null || exit 1"]
       interval: 5s
       timeout: 5s
       retries: 20
