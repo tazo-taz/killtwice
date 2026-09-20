@@ -147,12 +147,30 @@ export class ApiController {
       size: Math.min(Number(size) || 25, 100),
       from: Number(from) || 0,
       sort: [{ row_version: 'desc' }],
+      // Without this Elasticsearch stops counting at 10,000 and reports
+      // exactly that, so the console would show a capped number as though it
+      // were the real one. An operator comparing "matching documents"
+      // against the source count needs the true figure.
+      track_total_hits: true,
+      // phrase_prefix only works on `text` fields. Of the four searchable
+      // fields only full_name is text - email, country and status are
+      // keyword, and a phrase_prefix against them is a hard 400, not a
+      // degraded result. Keyword fields get a `prefix` query instead.
+      //
+      // The case folding is tailored to the seeded data (country codes are
+      // upper, everything else lower) because a keyword prefix is matched
+      // verbatim. A normalised lowercase sub-field in the mapping would be
+      // the general fix and would need a reindex.
       query: q
         ? {
-            multi_match: {
-              query: q,
-              fields: ['email', 'full_name', 'country', 'status'],
-              type: 'phrase_prefix',
+            bool: {
+              minimum_should_match: 1,
+              should: [
+                { match_phrase_prefix: { full_name: q } },
+                { prefix: { email: q.toLowerCase() } },
+                { prefix: { status: q.toLowerCase() } },
+                { prefix: { country: q.toUpperCase() } },
+              ],
             },
           }
         : { match_all: {} },

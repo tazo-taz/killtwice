@@ -274,6 +274,7 @@ Stated here rather than discovered by a reviewer:
 
 - **The consumer is the slowest link.** It applies one row per message with `prefetch=200`. During a 500k backfill it trails the Elasticsearch sink by a wide margin and catches up afterwards. Batching the projection writes is the obvious fix and is not done.
 - **`make verify` runs two full backfills**, one for G1 and one for G2, because both need a known starting point. That is most of the wall-clock time and could be halved by having G2 reuse G1's end state — at the cost of the gates no longer being independently runnable, which is worse.
+- **Nothing automatically tests the UI.** `make verify` drives the API, by design — but that means the console is only as good as the last time someone opened it. This is not hypothetical: the data panel's search was a hard HTTP 400 for its entire life and every gate passed twice while it was broken (`docs/DEVIATIONS.md` D-011). It is fixed and manually verified; it is still not covered.
 - **Numbers in this README are from one machine.** Windows 11, Docker Desktop, everything on one host competing for the same CPU and disk. They are honest measurements, not a benchmark.
 
 ## Where the checkpoints are

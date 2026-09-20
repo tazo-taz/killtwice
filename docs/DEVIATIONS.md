@@ -57,6 +57,16 @@ An entry is worth writing when the answer to *"was that a decision or an acciden
 **Decision or accident:** the spec was under-specified, and the gap only became visible once the slot existed. Seeding five million rows with a slot open streams the bulk load back through CDC as five million "changes" — correct by the invariants, and completely pointless. Leaving the old index in place would have made every count comparison in G2 meaningless.
 **Resolution:** spec updated in v2 to say seeding is a reset. This is the entry that best shows why writing the spec first still leaves things to find: nothing about the requirement was wrong, it just did not go far enough to be implementable.
 
+## D-011 — the data panel's search was a hard 400, and nothing noticed
+
+**Date:** 2026-09-20
+**Spec said:** §1 — the UI must cover "data browse + search".
+**Code did:** the search endpoint used `multi_match` with `type: phrase_prefix` across `email`, `full_name`, `country` and `status`. Only `full_name` is a `text` field; the other three are `keyword`, and a phrase-prefix query against a keyword field is a `query_shard_exception` — HTTP 400, not a degraded result. Browsing worked, because an empty query takes the `match_all` branch. Typing a single character into the search box broke the panel.
+**Decision or accident:** accident. The more useful observation is *how long it survived*: `make verify` never touched it, because the gates drive the API and the gates have no reason to search. Every gate passed, twice, with a visibly broken feature sitting in the deliverable.
+**Resolution:** keyword fields get a `prefix` query and the text field keeps `match_phrase_prefix`, combined in a `bool.should`. Also added `track_total_hits: true` — Elasticsearch stops counting at 10,000 by default, so the console was reporting a capped number as though it were the real one, which is the same class of mistake as a stale `healthy: true`. Verified: 501,000 total against a source of 501,000, 63,500 for `GE`, 124,951 for `trial`, 0 for nonsense.
+
+This is the clearest argument in the repository for the brief's insistence that the UI be *usable*, not just present. The gates prove the pipeline. Nothing proves the UI, and that gap is now stated in the README rather than left to be discovered.
+
 ## D-006 — the compose file would have made G1 pass without testing anything
 
 **Date:** 2026-09-20
