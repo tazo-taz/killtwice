@@ -110,8 +110,13 @@ export class StatusService implements OnApplicationBootstrap, OnModuleDestroy {
     // client's 15s request timeout, so `healthy` would keep answering true
     // for fifteen seconds into an outage - which is a wrong answer, not a
     // slow one.
-    this.sinkUp.elasticsearch = await this.orDefault(this.es.ping(), false, 2000);
-    this.sinkUp.rabbitmq = await this.orDefault(this.mq.ping(), false, 2000);
+    // Probed together: in sequence, a paused Elasticsearch spends its whole
+    // 2s before RabbitMQ is even asked, and the refresh outlasts its own 2s
+    // timer for the entire outage.
+    [this.sinkUp.elasticsearch, this.sinkUp.rabbitmq] = await Promise.all([
+      this.orDefault(this.es.ping(), false, 2000),
+      this.orDefault(this.mq.ping(), false, 2000),
+    ]);
     this.metrics.sinkUp.set({ sink: 'elasticsearch' }, this.sinkUp.elasticsearch ? 1 : 0);
     this.metrics.sinkUp.set({ sink: 'rabbitmq' }, this.sinkUp.rabbitmq ? 1 : 0);
   }

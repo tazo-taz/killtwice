@@ -4,8 +4,8 @@ import { config } from '../config';
 import { logger } from '../logger';
 import { Envelope, ErrorClass } from '../types';
 
+/** Only for items the bulk response reported an error on - success needs no verdict. */
 export type ItemVerdict =
-  | { kind: 'ok' }
   | { kind: 'stale' }
   | { kind: 'retryable'; detail: unknown }
   | { kind: 'permanent'; errorClass: ErrorClass; detail: unknown };
@@ -16,6 +16,24 @@ export interface BulkOutcome {
   retryable: { env: Envelope; detail: unknown }[];
   permanent: { env: Envelope; errorClass: ErrorClass; detail: unknown }[];
 }
+
+/** The cluster is busy or degraded - the same item may well succeed later. */
+const RETRYABLE_TYPES = new Set([
+  'circuit_breaking_exception',
+  'es_rejected_execution_exception',
+  'unavailable_shards_exception',
+  'cluster_block_exception',
+  'no_shard_available_action_exception',
+  'process_cluster_event_timeout_exception',
+]);
+
+/** The document itself is unacceptable. Retrying it changes nothing. */
+const MAPPING_TYPES = new Set([
+  'document_parsing_exception',
+  'mapper_parsing_exception',
+  'strict_dynamic_mapping_exception',
+  'illegal_argument_exception',
+]);
 
 /**
  * Per-item classification. This is the whole of G4: `_bulk` answers HTTP 200
@@ -28,26 +46,10 @@ function classify(status: number, type: string): ItemVerdict {
     // system working, and it is what makes a replayed duplicate a no-op.
     return { kind: 'stale' };
   }
-
-  const retryableTypes = new Set([
-    'circuit_breaking_exception',
-    'es_rejected_execution_exception',
-    'unavailable_shards_exception',
-    'cluster_block_exception',
-    'no_shard_available_action_exception',
-    'process_cluster_event_timeout_exception',
-  ]);
-  if (status === 429 || status >= 502 || retryableTypes.has(type)) {
+  if (status === 429 || status >= 502 || RETRYABLE_TYPES.has(type)) {
     return { kind: 'retryable', detail: type };
   }
-
-  const mappingTypes = new Set([
-    'document_parsing_exception',
-    'mapper_parsing_exception',
-    'strict_dynamic_mapping_exception',
-    'illegal_argument_exception',
-  ]);
-  if (mappingTypes.has(type)) {
+  if (MAPPING_TYPES.has(type)) {
     return { kind: 'permanent', errorClass: 'mapping', detail: type };
   }
   if (status === 413 || type === 'entity_content_too_long_exception') {
@@ -167,12 +169,8 @@ export class EsService {
         case 'retryable':
           out.retryable.push({ env, detail: r.error });
           break;
-        default:
-          out.permanent.push({
-            env,
-            errorClass: (verdict as { errorClass: ErrorClass }).errorClass,
-            detail: r.error,
-          });
+        case 'permanent':
+          out.permanent.push({ env, errorClass: verdict.errorClass, detail: r.error });
           logger.warn(
             { batch_id: batchId, record_id: env.id, error: r.error.type },
             'elasticsearch rejected item permanently',

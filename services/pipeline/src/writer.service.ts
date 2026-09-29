@@ -4,10 +4,12 @@ import { config } from './config';
 import { logger } from './logger';
 import { DlqService } from './dlq.service';
 import { MetricsService } from './metrics.service';
-import { EsService } from './sinks/es.service';
+import { BulkOutcome, EsService } from './sinks/es.service';
 import { MqService } from './sinks/mq.service';
 import { sleep, nextDelay } from './util/backoff';
 import { BatchResult, Envelope, ErrorClass, Mode } from './types';
+
+type Sink = 'elasticsearch' | 'rabbitmq';
 
 /**
  * Writes one batch to both sinks and does not return until every envelope is
@@ -65,7 +67,7 @@ export class WriterService {
   }
 
   private async fail(
-    sink: 'elasticsearch' | 'rabbitmq',
+    sink: Sink,
     env: Envelope,
     errorClass: ErrorClass,
     detail: unknown,
@@ -79,11 +81,60 @@ export class WriterService {
     }
   }
 
-  private async toElasticsearch(
+  /** `written` and `stale` in the result describe the index, the sink that holds state. */
+  private toElasticsearch(
     batch: Envelope[],
     batchId: string,
     result: BatchResult,
     toDlq: boolean,
+  ): Promise<void> {
+    return this.deliver('elasticsearch', batch, batchId, result, toDlq, {
+      send: async (pending) => {
+        const outcome = await this.es.bulk(pending, batchId);
+        result.written += outcome.ok.length;
+        result.stale += outcome.stale.length;
+        return outcome;
+      },
+      exhausted: () => 'rejected',
+    });
+  }
+
+  /**
+   * The broker has no per-item verdicts beyond confirmed or not, so every
+   * unconfirmed message is retryable until the item budget runs out.
+   */
+  private toRabbitmq(
+    batch: Envelope[],
+    batchId: string,
+    result: BatchResult,
+    toDlq: boolean,
+  ): Promise<void> {
+    return this.deliver('rabbitmq', batch, batchId, result, toDlq, {
+      send: async (pending) => {
+        const outcome = await this.mq.publishBatch(pending, batchId);
+        return { ok: outcome.ok, stale: [], retryable: outcome.failed, permanent: [] };
+      },
+      exhausted: (detail) => (detail === 'unroutable' ? 'unroutable' : 'rejected'),
+    });
+  }
+
+  /**
+   * The retry loop both sinks share. `send` throws only when the whole round
+   * trip failed (sink down, timeout); per-item failures come back in the
+   * outcome. Items that succeeded are never re-sent, which is the clause G4
+   * calls unacceptable to violate.
+   */
+  private async deliver(
+    sink: Sink,
+    batch: Envelope[],
+    batchId: string,
+    result: BatchResult,
+    toDlq: boolean,
+    how: {
+      send: (pending: Envelope[]) => Promise<BulkOutcome>;
+      /** Error class for an item still retryable when its budget runs out. */
+      exhausted: (detail: unknown) => ErrorClass;
+    },
   ): Promise<void> {
     let pending = batch;
 
@@ -94,36 +145,32 @@ export class WriterService {
     let itemAttempt = 0;
 
     while (pending.length > 0) {
-      const stopTimer = this.metrics.writeDuration.startTimer({ sink: 'elasticsearch' });
-      let outcome;
+      const stopTimer = this.metrics.writeDuration.startTimer({ sink });
+      let outcome: BulkOutcome;
       try {
-        outcome = await this.es.bulk(pending, batchId);
+        outcome = await how.send(pending);
         stopTimer();
-        this.metrics.sinkUp.set({ sink: 'elasticsearch' }, 1);
+        this.metrics.sinkUp.set({ sink }, 1);
         transportAttempt = 0;
       } catch (err) {
         stopTimer();
-        this.metrics.sinkUp.set({ sink: 'elasticsearch' }, 0);
-        this.metrics.retries.inc({ sink: 'elasticsearch' });
+        this.metrics.sinkUp.set({ sink }, 0);
+        this.metrics.retries.inc({ sink });
         transportAttempt += 1;
         const delay = nextDelay(transportAttempt);
         logger.warn(
           { batch_id: batchId, attempt: transportAttempt, delay_ms: delay, err: String(err) },
-          'elasticsearch unreachable, backing off',
+          `${sink} unreachable, backing off`,
         );
         await sleep(delay);
         continue;
       }
 
-      result.written += outcome.ok.length;
-      result.stale += outcome.stale.length;
-      this.metrics.rowsWritten.inc({ sink: 'elasticsearch' }, outcome.ok.length);
-      this.metrics.rowsStale.inc({ sink: 'elasticsearch' }, outcome.stale.length);
+      this.metrics.rowsWritten.inc({ sink }, outcome.ok.length);
+      this.metrics.rowsStale.inc({ sink }, outcome.stale.length);
 
-      // The ones that succeeded are committed. They are never re-sent, which
-      // is the clause G4 calls unacceptable to violate.
       for (const p of outcome.permanent) {
-        await this.fail('elasticsearch', p.env, p.errorClass, p.detail, result, toDlq);
+        await this.fail(sink, p.env, p.errorClass, p.detail, result, toDlq);
       }
 
       if (outcome.retryable.length === 0) return;
@@ -131,63 +178,13 @@ export class WriterService {
       itemAttempt += 1;
       if (itemAttempt >= config.maxItemAttempts) {
         for (const r of outcome.retryable) {
-          await this.fail('elasticsearch', r.env, 'rejected', r.detail, result, toDlq);
+          await this.fail(sink, r.env, how.exhausted(r.detail), r.detail, result, toDlq);
         }
         return;
       }
 
       pending = outcome.retryable.map((r) => r.env);
-      this.metrics.retries.inc({ sink: 'elasticsearch' }, pending.length);
-      await sleep(nextDelay(itemAttempt));
-    }
-  }
-
-  private async toRabbitmq(
-    batch: Envelope[],
-    batchId: string,
-    result: BatchResult,
-    toDlq: boolean,
-  ): Promise<void> {
-    let pending = batch;
-    let transportAttempt = 0;
-    let itemAttempt = 0;
-
-    while (pending.length > 0) {
-      const stopTimer = this.metrics.writeDuration.startTimer({ sink: 'rabbitmq' });
-      let outcome;
-      try {
-        outcome = await this.mq.publishBatch(pending, batchId);
-        stopTimer();
-        this.metrics.sinkUp.set({ sink: 'rabbitmq' }, 1);
-        transportAttempt = 0;
-      } catch (err) {
-        stopTimer();
-        this.metrics.sinkUp.set({ sink: 'rabbitmq' }, 0);
-        this.metrics.retries.inc({ sink: 'rabbitmq' });
-        transportAttempt += 1;
-        const delay = nextDelay(transportAttempt);
-        logger.warn(
-          { batch_id: batchId, attempt: transportAttempt, delay_ms: delay, err: String(err) },
-          'rabbitmq unreachable, backing off',
-        );
-        await sleep(delay);
-        continue;
-      }
-
-      this.metrics.rowsWritten.inc({ sink: 'rabbitmq' }, outcome.ok.length);
-      if (outcome.failed.length === 0) return;
-
-      itemAttempt += 1;
-      if (itemAttempt >= config.maxItemAttempts) {
-        for (const f of outcome.failed) {
-          const cls: ErrorClass = f.detail === 'unroutable' ? 'unroutable' : 'rejected';
-          await this.fail('rabbitmq', f.env, cls, f.detail, result, toDlq);
-        }
-        return;
-      }
-
-      pending = outcome.failed.map((f) => f.env);
-      this.metrics.retries.inc({ sink: 'rabbitmq' }, pending.length);
+      this.metrics.retries.inc({ sink }, pending.length);
       await sleep(nextDelay(itemAttempt));
     }
   }
