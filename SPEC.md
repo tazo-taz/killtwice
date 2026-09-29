@@ -1,6 +1,6 @@
 # SPEC — Kill It Twice
 
-**Version:** v2 — see [Revision history](#11-revision-history) for what changed from v1 and why.
+**Version:** v2.1 — see [Revision history](#11-revision-history) for what changed from v1 and why.
 **Status:** v1 was written before any implementation code existed, and was wrong in the places recorded below. Every point where the implementation contradicted it is logged in `docs/DEVIATIONS.md`.
 **Audience:** me, and the coding agent working under `AGENTS.md`.
 
@@ -117,11 +117,20 @@ POST /api/backfill/start     { chunkSize? }
 POST /api/backfill/stop
 POST /api/stream/start
 POST /api/stream/stop
-GET  /api/dlq                paginated
-POST /api/dlq/replay         { ids?: string[] }   omit ids to replay all
-POST /api/chaos/poison       inject rejectable rows
-POST /api/chaos/mutate       { rate, ops }        drive source mutations
+POST /api/reset                                   seeding is a reset, see §10
+GET  /api/dlq                ?status=pending|resolved|all&limit=
+POST /api/dlq/replay         { ids?: string[], from?: 'payload'|'source', limit? }
+                                                  omit ids to replay all pending
+POST /api/chaos/poison       { total?, poison? }  inject rejectable rows (default 500 / 3)
+POST /api/chaos/unpoison     { ids?: number[] }   make poisoned rows valid again
+POST /api/chaos/mutate       { count?, op? }      op: update|delete|mixed
+POST /api/chaos/hard-delete  { count? }           a real DELETE, for the WAL delete path
+GET  /api/verify/counts                           source vs sink counts, for the gates
+GET  /api/verify/sample      ?n=                  source vs Elasticsearch row_version sample
+GET  /api/records            ?q=&size=&from=      what landed in the index, for the UI
 ```
+
+`/api/chaos/mutate` was specified in v1 as `{ rate, ops }` — a mutation *rate*. What got built is a one-shot `{ count, op }`, because the gates need mutations at controlled moments and a rate makes every count assertion racy (README, "what I did not build": no continuous mutator). v2.1 records the interface as built.
 
 ## 9. Backpressure, restated
 
@@ -141,6 +150,8 @@ A single shared queue would have made the checkpoint ambiguous: a mixed batch ha
 The slot part is not housekeeping. With a slot open, a five-million-row bulk load streams back through CDC as five million "changes" — correct by the invariants and completely pointless. This was not in v1 at all; the gap only became visible once the slot existed.
 
 ## 11. Revision history
+
+**v2.1** — §8 brought in line with the API the gates actually drive. v2 corrected the design and left the interface list at its v1 text, which named a mutate body the code never accepted and omitted six endpoints `make verify` depends on. No design change.
 
 **v2 (2026-09-20)** — written after the implementation existed, correcting v1 where reality disagreed:
 
