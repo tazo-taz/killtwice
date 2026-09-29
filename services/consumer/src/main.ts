@@ -81,7 +81,10 @@ async function flushCounters(): Promise<void> {
        ON CONFLICT (key) DO UPDATE SET value = consumer.stats.value + EXCLUDED.value`,
       [key, value],
     );
-    counters[key as keyof typeof counters] = 0;
+    // Subtract what was written rather than zeroing. Messages keep arriving
+    // during the await above, and zeroing would discard every increment
+    // they made - undercounting the duplicates G2 reports.
+    counters[key as keyof typeof counters] -= value;
   }
 }
 
@@ -217,5 +220,17 @@ createServer((req, res) => {
   res.end();
 }).listen(cfg.port, () => logger.info({ port: cfg.port }, 'consumer http listening'));
 
-setInterval(() => void flushCounters().catch(() => undefined), 1000);
+// One flush at a time. With a slow database the interval fires again before
+// the last flush finishes, and two flushes reading the same counter would
+// both write it.
+let flushing = false;
+setInterval(() => {
+  if (flushing) return;
+  flushing = true;
+  flushCounters()
+    .catch((err: unknown) => logger.warn({ err: String(err) }, 'counter flush failed, retrying'))
+    .finally(() => {
+      flushing = false;
+    });
+}, 1000);
 void start();
