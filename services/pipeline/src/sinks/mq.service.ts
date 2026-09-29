@@ -40,6 +40,14 @@ export class MqService implements OnModuleDestroy {
 
     const ch = await conn.createConfirmChannel();
 
+    // A channel can close on its own - a broker-side channel error, say - with
+    // the connection still up. Without this the dead channel stays cached and
+    // every publish fails against it forever, which the writer can only
+    // answer by backing off forever.
+    ch.on('close', () => {
+      if (this.channel === ch) this.channel = null;
+    });
+
     await ch.assertExchange(config.mqExchange, 'topic', { durable: true });
     await ch.assertExchange(config.mqDlx, 'topic', { durable: true });
     await ch.assertQueue(config.mqQueue, {
@@ -101,9 +109,10 @@ export class MqService implements OnModuleDestroy {
         }),
       );
 
+      let written = true;
       pending.push(
         new Promise<void>((resolve) => {
-          const written = ch.publish(
+          written = ch.publish(
             config.mqExchange,
             routingKey,
             body,
@@ -121,12 +130,12 @@ export class MqService implements OnModuleDestroy {
               resolve();
             },
           );
-
-          // The socket buffer is full. Waiting for drain is the difference
-          // between backpressure and an unbounded memory climb.
-          if (!written) ch.once('drain', () => undefined);
         }),
       );
+
+      // The socket buffer is full. Waiting for drain is the difference
+      // between backpressure and an unbounded memory climb.
+      if (!written) await this.drained(ch);
     }
 
     await Promise.all(pending);
@@ -137,6 +146,27 @@ export class MqService implements OnModuleDestroy {
       );
     }
     return out;
+  }
+
+  /**
+   * Resolves on 'drain', rejects if the channel closes first. Waiting on
+   * 'drain' alone would hang forever on a connection lost mid-batch, with the
+   * batch and its checkpoint stuck behind it; rejecting turns that into an
+   * ordinary transport failure the writer backs off from.
+   */
+  private drained(ch: ConfirmCh): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      const onDrain = (): void => {
+        ch.off('close', onClose);
+        resolve();
+      };
+      const onClose = (): void => {
+        ch.off('drain', onDrain);
+        reject(new Error('channel closed while waiting for drain'));
+      };
+      ch.once('drain', onDrain);
+      ch.once('close', onClose);
+    });
   }
 
   async queueDepth(queue: string): Promise<number> {
