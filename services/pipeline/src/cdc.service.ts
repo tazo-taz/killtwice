@@ -54,6 +54,7 @@ export class CdcService {
   private confirmedLsn: string | null = null;
   private lastSeenLsn: string | null = null;
   private flusher: Promise<void> | null = null;
+  private generation = 0;
 
   constructor(
     private readonly db: DbService,
@@ -85,6 +86,17 @@ export class CdcService {
     this.confirmedLsn = null;
     this.eventsDone = 0;
     this.lastCommitTs = null;
+
+    // Everything buffered belongs to the slot that was just dropped, and a
+    // reset is about to wipe the sinks it was headed for. The paused flag
+    // goes too: only a flush clears it, and with the buffer gone there will
+    // be no flush, so a stale `true` would hold the next subscription off
+    // forever.
+    this.buffer = [];
+    this.lastSeenLsn = null;
+    this.paused = false;
+    this.metrics.readerPaused.set({ mode: 'stream' }, 0);
+    this.metrics.queueDepth.set({ mode: 'stream' }, 0);
   }
 
   async start(): Promise<void> {
@@ -105,8 +117,17 @@ export class CdcService {
     }
 
     this.enabled = true;
-    void this.runSubscription();
-    this.flusher = this.runFlusher();
+
+    // After a stop, the previous subscription loop wakes up from its closed
+    // stream and would find `enabled` true again. The generation tells it to
+    // exit instead of opening a second replication connection to the slot.
+    const generation = ++this.generation;
+    void this.runSubscription(generation);
+
+    // One flusher for the life of the process. Two would each take a batch,
+    // and whichever finished second could acknowledge the slot past events
+    // the other had not written yet.
+    this.flusher ??= this.runFlusher();
     await this.db.pipeline.query(
       `INSERT INTO pipeline.runtime_flags (key, value) VALUES ('stream','on')
        ON CONFLICT (key) DO UPDATE SET value='on'`,
@@ -181,10 +202,10 @@ export class CdcService {
     return null;
   }
 
-  private async runSubscription(): Promise<void> {
+  private async runSubscription(generation: number): Promise<void> {
     let attempt = 0;
 
-    while (this.enabled) {
+    while (this.enabled && generation === this.generation) {
       // Backpressure: while paused we are not consuming from the slot at all.
       // Postgres holds the changes in WAL, which is a durable buffer we do
       // not have to pay for in RAM. This is the sleep that keeps G3's CPU
@@ -285,7 +306,8 @@ export class CdcService {
   }
 
   private async runFlusher(): Promise<void> {
-    while (this.enabled || this.buffer.length > 0) {
+    // Runs for the life of the process; every idle pass sleeps.
+    for (;;) {
       if (this.buffer.length === 0) {
         // An empty buffer means everything received has been flushed, so the
         // slot can be moved forward to the last message we saw.
@@ -295,7 +317,7 @@ export class CdcService {
         // for every other table - including this pipeline's own checkpoint
         // writes. Measured: ~57MB of retained WAL over a ten minute run in
         // which the stream carried almost nothing.
-        if (this.lastSeenLsn && this.lastSeenLsn !== this.confirmedLsn) {
+        if (this.enabled && this.lastSeenLsn && this.lastSeenLsn !== this.confirmedLsn) {
           const idleLsn = this.lastSeenLsn;
           try {
             await this.service?.acknowledge(idleLsn);

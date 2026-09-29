@@ -4,7 +4,6 @@ import { logger } from './logger';
 import { DbService } from './db.service';
 import { MetricsService } from './metrics.service';
 import { WriterService } from './writer.service';
-import { sleep } from './util/backoff';
 import { Envelope, RecordDoc } from './types';
 
 const JOB_ID = 'default';
@@ -178,17 +177,30 @@ export class BackfillService {
 
       // Only now. Crashing one line earlier replays this chunk, which the
       // version guard absorbs. Crashing one line later would lose it.
-      await this.db.pipeline.query(
+      //
+      // Compare-and-set on last_key: the checkpoint only moves if it is still
+      // where this loop read it. A stop followed quickly by a start leaves the
+      // old loop finishing its in-flight chunk while a new one begins, and a
+      // reset starts a fresh job underneath it. An unconditional write from
+      // the old loop would drag the new job's checkpoint forward past rows it
+      // has not read - silent loss. Whoever loses the race stops; the other
+      // loop owns the job.
+      const moved = await this.db.pipeline.query(
         `UPDATE pipeline.backfill_jobs
             SET last_key = $2, rows_done = rows_done + $3, updated_at = now()
-          WHERE id = $1`,
-        [JOB_ID, newKey, chunk.rows.length],
+          WHERE id = $1 AND last_key = $4`,
+        [JOB_ID, newKey, chunk.rows.length, lastKey],
       );
+      if (moved.rowCount === 0) {
+        logger.warn(
+          { mode: 'backfill', chunk_key: lastKey },
+          'checkpoint moved underneath this loop, yielding the job',
+        );
+        break;
+      }
 
       this.metrics.backfillLastKey.set(newKey);
       this.metrics.queueDepth.set({ mode: 'backfill' }, 0);
     }
-
-    await sleep(0);
   }
 }
