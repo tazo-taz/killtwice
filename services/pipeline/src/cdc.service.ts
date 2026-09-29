@@ -15,7 +15,25 @@ interface PgoutputMessage {
   old?: Record<string, unknown>;
   key?: Record<string, unknown>;
   commitTime?: unknown;
+  commitLsn?: string | null;
   commitEndLsn?: string;
+}
+
+/**
+ * One transaction as it streams in. `commitLsn` identifies it - pgoutput puts
+ * the same final LSN on its begin and its commit - and `skip` is how many of
+ * its change events were already taken on an earlier subscription.
+ */
+interface TxnProgress {
+  commitLsn: string;
+  received: number;
+  skip: number;
+}
+
+/** LSNs are "hi/lo" in hex; comparing them as strings is wrong past one digit. */
+function lsnValue(lsn: string): bigint {
+  const [hi, lo] = lsn.split('/');
+  return (BigInt(`0x${hi}`) << 32n) + BigInt(`0x${lo}`);
 }
 
 interface Buffered {
@@ -56,6 +74,13 @@ export class CdcService {
   private flusher: Promise<void> | null = null;
   private generation = 0;
 
+  // Resend bookkeeping, see beginTxn(). In memory on purpose: after a crash
+  // everything is resent from the persisted LSN and the version guard absorbs
+  // it. This only has to stop one live process re-reading its own buffer.
+  private receivedCommitLsn: string | null = null;
+  private txn: TxnProgress | null = null;
+  private cutOff: TxnProgress | null = null;
+
   constructor(
     private readonly db: DbService,
     private readonly writer: WriterService,
@@ -94,6 +119,9 @@ export class CdcService {
     // forever.
     this.buffer = [];
     this.lastSeenLsn = null;
+    this.receivedCommitLsn = null;
+    this.txn = null;
+    this.cutOff = null;
     this.paused = false;
     this.metrics.readerPaused.set({ mode: 'stream' }, 0);
     this.metrics.queueDepth.set({ mode: 'stream' }, 0);
@@ -228,12 +256,29 @@ export class CdcService {
 
       service.on('data', (lsn: string, log: PgoutputMessage) => {
         this.lastSeenLsn = lsn;
+        if (log.tag === 'begin') {
+          this.txn = this.beginTxn(log.commitLsn ?? null);
+          return;
+        }
         if (log.tag === 'commit') {
           this.lastCommitTs = this.toDate(log.commitTime) ?? this.lastCommitTs;
+          const c = log.commitLsn;
+          if (c && (!this.receivedCommitLsn || lsnValue(c) > lsnValue(this.receivedCommitLsn))) {
+            this.receivedCommitLsn = c;
+          }
+          this.txn = null;
           return;
         }
         const env = this.toEnvelope(log, lsn);
         if (!env) return;
+
+        if (this.txn) {
+          this.txn.received += 1;
+          if (this.txn.received <= this.txn.skip) {
+            this.metrics.cdcResendSkipped.inc();
+            return;
+          }
+        }
 
         this.buffer.push({ env, lsn, commitTs: this.lastCommitTs });
         this.metrics.rowsRead.inc({ mode: 'stream' });
@@ -288,7 +333,44 @@ export class CdcService {
         );
         await sleep(delay);
       }
+
+      // The subscription ended - paused, stopped or failed. If it ended inside
+      // a transaction, remember how far in; the resend starts it from the top.
+      if (this.txn) this.cutOff = this.txn;
+      this.txn = null;
     }
+  }
+
+  /**
+   * Postgres never resends part of a transaction. Resubscribing from an LSN
+   * inside one - which is exactly where a full buffer stops the reader -
+   * sends the whole transaction again from its first row. Buffering the
+   * resend as it arrives meant a transaction larger than QUEUE_CAPACITY
+   * refilled the buffer with rows already in it, paused again, resubscribed
+   * again, and never got past itself: a livelock, with every later change
+   * queued behind it.
+   *
+   * So a resend is recognised and dropped. Transactions arrive in commit
+   * order, so one whose commit is at or before the last commit fully
+   * received was already taken whole. The one transaction the reader was cut
+   * off inside skips the events it already took. LSN alone cannot do this:
+   * concurrent transactions interleave, so a later transaction can contain
+   * changes with lower LSNs than an earlier one.
+   */
+  private beginTxn(commitLsn: string | null): TxnProgress | null {
+    if (!commitLsn) return null;
+    let skip = 0;
+    if (this.receivedCommitLsn && lsnValue(commitLsn) <= lsnValue(this.receivedCommitLsn)) {
+      skip = Number.POSITIVE_INFINITY;
+    } else if (this.cutOff?.commitLsn === commitLsn) {
+      skip = this.cutOff.received;
+      logger.info(
+        { mode: 'stream', lsn: commitLsn, skip },
+        'resumed inside a transaction, skipping events already taken',
+      );
+    }
+    if (this.cutOff && lsnValue(commitLsn) >= lsnValue(this.cutOff.commitLsn)) this.cutOff = null;
+    return { commitLsn, received: 0, skip };
   }
 
   private async persistCheckpoint(lsn: string, commitTs: Date | null): Promise<void> {

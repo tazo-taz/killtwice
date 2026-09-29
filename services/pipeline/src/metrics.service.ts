@@ -89,6 +89,12 @@ export class MetricsService {
     registers: [this.registry],
   });
 
+  readonly cdcResendSkipped = new Counter({
+    name: 'pipeline_cdc_resend_skipped_total',
+    help: 'Change events Postgres resent after a resubscribe that were already taken, dropped rather than buffered twice',
+    registers: [this.registry],
+  });
+
   readonly dlqSize = new Gauge({
     name: 'pipeline_dlq_size',
     help: 'Pending items in the dead letter queue',
